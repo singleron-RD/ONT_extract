@@ -4,6 +4,8 @@ from ssw_align import Align_dna, read_fa_fq, buildPath, buildAlignPath
 from celescope.tools.barcode import Barcode
 from celescope.tools import utils
 
+DEBUG = True
+
 def get_bc_umi(target, query):
     """
     >>> target = "CTTCCGATCTAGACGTTCATCGGTGACAGCCATATGGTAGTCCACGTAGTCAGAAGCTGAACTCTGTGACTATGACTCTTTTTTTTT"
@@ -65,13 +67,29 @@ def polyT(seq):
         i += 1
     return res
 
-class Anchor:
-    MIN_SCORE = 25
+def get_patterns():
+    ADAPTER1 = 'CTTCCGATCT'
+    chemistry = 'scopeV3.0.1'
+    linker_f, _ = Barcode.get_scope_bc(chemistry)
+    linkers,_ = utils.read_one_col(linker_f)
+    len_half = len(linkers[0]) // 2
+    patterns = []
+    for linker in linkers:
+        cur = ADAPTER1 + 'N'*9 + linker[:len_half] + 'N'*9 + linker[len_half:-1] + 'N'*9 + 'C' +'N'*12 + 'T' * 5
+        patterns.append(cur)
+    return patterns
+
+class Extract:
+    MIN_SCORE = 70
     LEN_UMI = 12
     LEN_BC_SEG = 9
     OFFSET = 10
     LEN_LINKER_SEG = 16
     def __init__(self, args):
+        # global
+        self.patterns = get_patterns()
+        self.align_runner = Align_dna()
+        # metrics
         self.total = 0
         self.forward = 0
         self.reverse = 0
@@ -79,13 +97,14 @@ class Anchor:
         self.reverse_strand_fused = 0
         self.double_strand_fused = 0
         self.no_polyT = 0
-
+        self.valid_pattern = 0
+        # args
         self.fastq = args.fastq
         # out
-        self.r1 = 'anchor.fa'
-        self.r2 = 'insert.fq'
-        self.r1_handle = open(self.r1,'w')
-        self.r2_handle = open(self.r2,'w')
+        self.bc_umi = 'bc_umi.fa'
+        self.bc_umi_handle = open(self.bc_umi,'w')
+        self.insert = 'insert.fq'
+        self.insert_handle = open(self.insert,'w')
 
     def process(self, id, seq, qual):
         self.total += 1
@@ -116,57 +135,47 @@ class Anchor:
         if valid_polyT:
             tStart, tEnd = res_f[0]
             seq_anchor = seq[:tEnd]
-            seq_insert = seq[tEnd:]
-            qual_insert = qual[tEnd:]
-            self.r1_handle.write(f'>{id}\n{seq_anchor}\n')
-            self.r2_handle.write(f'@{id}\n{seq_insert}\n+\n{qual_insert}\n')
+            if len(seq_anchor) < 70: return
+            score, bcs, umi = self.get_valid_bc_umi(seq_anchor)
+            if bcs and umi:
+                bc = '_'.join(bcs)
+                self.bc_umi_handle.write(f'>{id} {score}\n{bc}:{umi}\n')
+                seq_insert = seq[tEnd:]
+                qual_insert = qual[tEnd:]
+                self.insert_handle.write(f'@{id}\n{seq_insert}\n+\n{qual_insert}\n')
+                self.valid_pattern += 1
+    
+    def get_valid_bc_umi(self, seq_anchor):
+        max_score = 0
+        win_nScore = win_nQryBeg = win_nRefBeg = win_lCigar = win_pattern = None
+        for pattern in self.patterns:
+            nScore, nQryBeg, nRefBeg, lCigar= self.align_runner.align_seq(seq_anchor, pattern)
+            if nScore > max_score:
+                max_score = nScore
+                win_nQryBeg = nQryBeg
+                win_nRefBeg = nRefBeg
+                win_lCigar = lCigar
+                win_pattern = pattern
+        _cigar, sQ, _sA, sR = buildAlignPath(seq_anchor, win_pattern, win_nQryBeg, win_nRefBeg, win_lCigar)
+        bcs, umi = get_bc_umi(sQ,sR)
+        if len(bcs) < 2: bcs = []
+        if len(bcs) == 2:
+            if win_nQryBeg < self.LEN_BC_SEG:
+                bcs = []
+            else:
+                bc1 = seq_anchor[win_nQryBeg - self.LEN_BC_SEG: win_nQryBeg]
+                bcs = [bc1] + bcs
+        if DEBUG:
+            print(max_score,bcs,umi)
+            print(sQ,_sA,sR,sep='\n')
+        return max_score,bcs,umi
+
 
 
     def run(self):
         for id,seq,qual in read_fa_fq(self.fastq):
             self.process(id,seq,qual)
-        print(self.forward,self.reverse,self.forward_strand_fused,self.reverse_strand_fused,self.double_strand_fused)   
-
-
-class Extract:
-    MIN_SCORE = 60
-    def __init__(self) -> None:
-        self.patterns = self.get_patterns()
-        self.anchor = 'anchor.fa'
-
-        self.valid_pattern = 0
-        # out
-        self.bc_umi = 'bc_umi.fa'
-        self.bc_umi_handle = open(self.bc_umi,'w')
-
-    def get_patterns(self):
-        ADAPTER1 = 'CTTCCGATCT'
-        chemistry = 'scopeV3.0.1'
-        linker_f, _ = Barcode.get_scope_bc(chemistry)
-        linkers,_ = utils.read_one_col(linker_f)
-        len_half = len(linkers[0]) // 2
-        patterns = []
-        for linker in linkers:
-            cur = ADAPTER1 + 'N'*9 + linker[:len_half] + 'N'*9 + linker[len_half:-1] + 'N'*9 + 'C' +'N'*12 + 'T' * 10
-            patterns.append(cur)
-        return patterns
-
-    @utils.add_log
-    def run(self):
-        runner = Align_dna()
-        for id,seq,qual in read_fa_fq(self.anchor):
-            for pattern in self.patterns:
-                nScore, nQryBeg, nRefBeg, lCigar= runner.align_seq(seq, pattern)
-                if nScore >= self.MIN_SCORE:
-                    _,sQ,sA, sR = buildAlignPath(seq, pattern, nQryBeg, nRefBeg, lCigar)
-                    bcs, umi = get_bc_umi(sQ,sR)
-                    print(nScore,sQ,sA,sR,sep='\n')
-                    print(bcs,umi)
-                    bc = '_'.join(bcs)
-                    self.bc_umi_handle.write(f'>{id}\n{bc}:{umi}\n')
-                    self.valid_pattern += 1
-                    break
-        print(self.valid_pattern)
+        print(self.forward,self.reverse,self.forward_strand_fused,self.reverse_strand_fused,self.double_strand_fused,self.valid_pattern)   
 
 
 
@@ -174,7 +183,5 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('fastq', help='fastq file')
     args = parser.parse_args()
-    anchor = Anchor(args)
-    anchor.run()
-    extract = Extract()
+    extract = Extract(args)
     extract.run()
