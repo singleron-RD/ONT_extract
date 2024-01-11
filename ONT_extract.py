@@ -1,10 +1,17 @@
 import argparse
 
+import editdistance
+
 from ssw_align import Align_dna, read_fa_fq, buildPath, buildAlignPath
-from celescope.tools.barcode import Barcode
+from celescope.tools.barcode import Barcode, Chemistry
 from celescope.tools import utils
 
-DEBUG = True
+DEBUG = False
+LEN_UMI = 12
+LEN_BC_SEG = 9
+LEN_LINKER_SEG = 16
+MAX_EDITDISTANCE = 2
+MAX_MISMATCH = 2
 
 def get_bc_umi(target, query):
     """
@@ -27,7 +34,7 @@ def get_bc_umi(target, query):
         while query[i] == 'N':
             i += 1
         cur_len = i-start
-        if cur_len == 9:
+        if cur_len == LEN_BC_SEG:
             bcs.append(target[start:i])
         else:
             umi = target[start:i]
@@ -67,28 +74,36 @@ def polyT(seq):
         i += 1
     return res
 
-def get_patterns():
+def get_patterns(linker_f):
     ADAPTER1 = 'CTTCCGATCT'
-    chemistry = 'scopeV3.0.1'
-    linker_f, _ = Barcode.get_scope_bc(chemistry)
     linkers,_ = utils.read_one_col(linker_f)
     len_half = len(linkers[0]) // 2
     patterns = []
     for linker in linkers:
-        cur = ADAPTER1 + 'N'*9 + linker[:len_half] + 'N'*9 + linker[len_half:-1] + 'N'*9 + 'C' +'N'*12 + 'T' * 5
+        cur = ADAPTER1 + 'N'*LEN_BC_SEG + linker[:len_half] + 'N'*LEN_BC_SEG + linker[len_half:-1] + 'N'*LEN_BC_SEG + 'C' +'N'*LEN_UMI+ 'T' * 5
         patterns.append(cur)
     return patterns
 
+def get_cellBC(cellBC_file):
+    if not cellBC_file: return set()
+    cellBC, _ncell = utils.read_one_col(cellBC_file)
+    if '_' not in cellBC[0]:
+        len_bc = len(cellBC[0])
+        sub_len = len_bc // 3
+        for i,bc in enumerate(cellBC):
+            cellBC[i] = bc[:sub_len] + '_' + bc[sub_len:2*sub_len] + '_' + bc[2*sub_len:]
+    return set(cellBC)
+
+
 class Extract:
-    MIN_SCORE = 70
-    LEN_UMI = 12
-    LEN_BC_SEG = 9
-    OFFSET = 10
-    LEN_LINKER_SEG = 16
     def __init__(self, args):
         # global
-        self.patterns = get_patterns()
+        chemistry = 'scopeV3.0.1'
+        linker_f, _ = Barcode.get_scope_bc(chemistry)
+        self.patterns = get_patterns(linker_f)
         self.align_runner = Align_dna()
+        whitelist_file = Chemistry.get_whitelist(chemistry)
+        self.barcode_set_list, self.barcode_mismatch_list = Barcode.parse_whitelist_file(whitelist_file, n_pattern=3, n_mismatch=MAX_MISMATCH)
         # metrics
         self.total = 0
         self.forward = 0
@@ -98,8 +113,12 @@ class Extract:
         self.double_strand_fused = 0
         self.no_polyT = 0
         self.valid_pattern = 0
+        self.valid_bc = 0
+        self.in_cell = 0
         # args
-        self.fastq = args.fastq
+        self.args = args
+        self.cellBC = get_cellBC(args.cellBC)
+
         # out
         self.bc_umi = 'bc_umi.fa'
         self.bc_umi_handle = open(self.bc_umi,'w')
@@ -133,17 +152,29 @@ class Extract:
             self.no_polyT += 1
 
         if valid_polyT:
-            tStart, tEnd = res_f[0]
+            _tStart, tEnd = res_f[0]
             seq_anchor = seq[:tEnd]
-            if len(seq_anchor) < 70: return
+            if len(seq_anchor) < 70: 
+                return
             score, bcs, umi = self.get_valid_bc_umi(seq_anchor)
-            if bcs and umi:
-                bc = '_'.join(bcs)
-                self.bc_umi_handle.write(f'>{id} {score}\n{bc}:{umi}\n')
-                seq_insert = seq[tEnd:]
-                qual_insert = qual[tEnd:]
-                self.insert_handle.write(f'@{id}\n{seq_insert}\n+\n{qual_insert}\n')
-                self.valid_pattern += 1
+            if not (bcs and umi): 
+                return
+            self.valid_pattern += 1
+            valid, bcs = self.is_bc_valid(bcs)
+            if DEBUG: print(valid,bcs)
+            if not all(valid): 
+                return
+            self.valid_bc += 1
+            bc = '_'.join(bcs)
+            if bc in self.cellBC:
+                self.in_cell += 1
+            elif self.args.only_cell: 
+                return
+            self.bc_umi_handle.write(f'>{id} {score}\n{bc}:{umi}\n')
+            seq_insert = seq[tEnd:]
+            qual_insert = qual[tEnd:]
+            self.insert_handle.write(f'@{id}\n{seq_insert}\n+\n{qual_insert}\n')
+
     
     def get_valid_bc_umi(self, seq_anchor):
         max_score = 0
@@ -160,28 +191,61 @@ class Extract:
         bcs, umi = get_bc_umi(sQ,sR)
         if len(bcs) < 2: bcs = []
         if len(bcs) == 2:
-            if win_nQryBeg < self.LEN_BC_SEG:
+            if win_nQryBeg < LEN_BC_SEG:
                 bcs = []
             else:
-                bc1 = seq_anchor[win_nQryBeg - self.LEN_BC_SEG: win_nQryBeg]
+                bc1 = seq_anchor[win_nQryBeg - LEN_BC_SEG: win_nQryBeg]
                 bcs = [bc1] + bcs
         if DEBUG:
             print(max_score,bcs,umi)
             print(sQ,_sA,sR,sep='\n')
         return max_score,bcs,umi
 
+    def is_bc_valid(self, bcs):
+        res = [""] * 3
+        valid = [False] * 3
+        for i, bc in enumerate(bcs):
+            if bc.count('-') > MAX_EDITDISTANCE:
+                continue
+            if bc in self.barcode_mismatch_list[i]:
+                valid[i] = True
+                res[i] = self.barcode_mismatch_list[i][bc]
+            else:
+                bc = bc.strip('-')
+                for wl_bc in self.barcode_set_list[i]:
+                    if editdistance.eval(wl_bc, bc) <= MAX_EDITDISTANCE:
+                        valid[i] = True
+                        res[i] = wl_bc
+
+        return valid, res
 
 
     def run(self):
-        for id,seq,qual in read_fa_fq(self.fastq):
+        for id,seq,qual in read_fa_fq(self.args.fastq):
             self.process(id,seq,qual)
-        print(self.forward,self.reverse,self.forward_strand_fused,self.reverse_strand_fused,self.double_strand_fused,self.valid_pattern)   
+        metrics = {
+            'total': self.total,
+            'forward': self.forward,
+            'reverse': self.reverse,
+            'forward_strand_fused': self.forward_strand_fused,
+            'reverse_strand_fused': self.reverse_strand_fused,
+            'double_strand_fused': self.double_strand_fused,
+            'no_polyT': self.no_polyT,
+            'valid_pattern': self.valid_pattern,
+            'valid_bc': self.valid_bc,
+            'in_cells': self.in_cell,
+        }
 
+        for k,v in metrics.items():
+            frac = round(v / self.total * 100,2)
+            print(f'{k}: {v}({frac}%)')   
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('fastq', help='fastq file')
+    parser.add_argument('-c','--cellBC', help='The path of barcodes.tsv file from short-reads library. If provided, the cell barcodes from short reads libary will be used to calculate fraction of reads in cells.')
+    parser.add_argument('--only_cell', help='Only output reads in cells. Use together with --cellBC.', action='store_true')
     args = parser.parse_args()
     extract = Extract(args)
     extract.run()
