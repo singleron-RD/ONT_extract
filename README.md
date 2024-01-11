@@ -2,6 +2,12 @@
 A tool to extract barcode and UMI from Nanopore(Oxford Nanopore Technologies) reads.
 
 # Overview
+
+Full length read
+```
+5' - read1(adapter) - bc1 - linker1 - bc2 - linker2 - bc3 - C - UMI - polyT - insert - TSO
+```
+
 1. Locate the polyT(or polyA if the read is on the reverse strand) region in the read. Reverse complement the read if it is on the reverse strand. 
 2. Discard all the read that is considered as a fused read(contain multiple polyT).
 3. Extract cell barcodes and UMIs by using (adapter,linker,polyT) as anchor.
